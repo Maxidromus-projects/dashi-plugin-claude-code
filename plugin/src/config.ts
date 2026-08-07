@@ -78,9 +78,15 @@ export const AppConfigSchema = z.object({
     flush_ms: z.number().int().positive().default(2000),
   }).default({}),
   voice: z.object({
-    provider: z.enum(['groq', 'none']).default('groq'),
+    // 'local' runs a self-contained whisper.cpp bundle on this host via
+    // `local_command` — no API key, no per-minute cost, and the audio
+    // never leaves the machine. 'groq' keeps the hosted Whisper path.
+    provider: z.enum(['groq', 'local', 'none']).default('groq'),
     language: z.string().default('ru'),
     model: z.string().default('whisper-large-v3-turbo'),
+    // Absolute path to an executable taking <audio-file> [lang] and
+    // printing the transcript on stdout. Required when provider='local'.
+    local_command: z.string().optional(),
   }).default({}),
   webhook: z.object({
     enabled: z.boolean().default(false),
