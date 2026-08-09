@@ -5,6 +5,34 @@
       "args": [
         "./src/server.ts"
       ]
+    },
+    "gbrain-memory": {
+      "type": "http",
+      "url": "https://mcp.brain.maxtwell.com/memory/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-recall": {
+      "type": "http",
+      "url": "https://mcp.brain.maxtwell.com/recall/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-swarm": {
+      "type": "http",
+      "url": "https://mcp.brain.maxtwell.com/swarm/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-tasks": {
+      "type": "http",
+      "url": "https://mcp.brain.maxtwell.com/tasks/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
     }
   }
 }

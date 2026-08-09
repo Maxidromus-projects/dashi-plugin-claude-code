@@ -87,6 +87,12 @@ export function computeContextUsage(
   lines: string[],
   windowTokens: number,
 ): ContextUsage | null {
+  // Post-compaction size, set when the backward scan meets a `compact_boundary`
+  // before any assistant turn. From that point on we keep scanning ONLY to pick
+  // up the model id of the newest turn before the boundary — the token count is
+  // already known and must not be overwritten by a pre-compact turn.
+  let compactedTokens: number | null = null
+
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]
     if (line === undefined || line.length === 0) continue
@@ -101,9 +107,30 @@ export function computeContextUsage(
     }
     if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) continue
 
-    const record = obj as { isSidechain?: unknown; message?: unknown }
+    const record = obj as {
+      isSidechain?: unknown
+      message?: unknown
+      type?: unknown
+      subtype?: unknown
+      compactMetadata?: unknown
+    }
     // Skip subagent/sidechain turns — their usage is a separate context.
     if (record.isSidechain === true) continue
+
+    // Compaction boundary. A /compact drops the window to `postTokens` and
+    // writes NO assistant turn, so scanning past this line would report the
+    // PRE-compact size until the next turn ends — the pinned card stayed at
+    // «87%» right after the user pressed «Сжать» (2026-08-08). A boundary
+    // without a usable postTokens (garbage / a future schema change) is
+    // ignored: the old behaviour is a stale number, still better than none.
+    if (compactedTokens === null && record.type === 'system' && record.subtype === 'compact_boundary') {
+      const meta = record.compactMetadata
+      if (typeof meta === 'object' && meta !== null) {
+        const post = toNonNegNumber((meta as { postTokens?: unknown }).postTokens)
+        if (post !== null && post > 0) compactedTokens = post
+      }
+      continue
+    }
 
     const message = record.message
     if (typeof message !== 'object' || message === null) continue
@@ -124,13 +151,16 @@ export function computeContextUsage(
     const cacheRead = toNonNegNumber(u.cache_read_input_tokens) ?? 0
     const cacheCreation = toNonNegNumber(u.cache_creation_input_tokens) ?? 0
 
-    const usedTokens = input + cacheRead + cacheCreation
+    const turnTokens = input + cacheRead + cacheCreation
     // FIX-13 (Fable L3): skip synthetic assistant turns whose usage sums to 0.
     // An API-error turn can persist a `usage` block of all-zeros; treating it as
     // the live window would flash the HUD to 0% mid-session. A real turn always
     // carries a non-zero input/cache footprint, so scan past a 0-sum turn to the
     // last genuine one.
-    if (usedTokens === 0) continue
+    if (turnTokens === 0) continue
+    // Past a compaction boundary this turn only donates its model id — the
+    // window size is `postTokens`, not this pre-compact footprint.
+    const usedTokens = compactedTokens ?? turnTokens
     const pct = windowTokens > 0 ? usedTokens / windowTokens : 0
     // Capture the model from THIS same turn (the one the usage came from). Hook
     // payloads omit the model entirely, so the transcript is the only source.
@@ -141,6 +171,15 @@ export function computeContextUsage(
       result.model = model
     }
     return result
+  }
+  // A compaction with no assistant turn anywhere before it (fresh session that
+  // opened with a compact, or a tail that starts past the previous turn): the
+  // boundary alone is a complete answer, only the model stays unknown.
+  if (compactedTokens !== null) {
+    return {
+      usedTokens: compactedTokens,
+      pct: windowTokens > 0 ? compactedTokens / windowTokens : 0,
+    }
   }
   return null
 }

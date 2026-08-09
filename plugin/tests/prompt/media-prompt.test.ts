@@ -398,3 +398,167 @@ describe('maybeTranscribeVoice', () => {
     expect(r.status).toBe('skipped')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// maybeTranscribeVoice — provider: 'local'
+//
+// Local transcription runs a self-contained whisper.cpp bundle on this
+// host instead of calling Groq. Motivation: no API key to obtain, no
+// per-minute cost, and voice notes never leave the machine.
+// ─────────────────────────────────────────────────────────────────────
+
+const localConfig: AppConfig = {
+  ...voiceConfig,
+  voice: {
+    ...voiceConfig.voice,
+    provider: 'local',
+    local_command: '/opt/whisper/transcribe.sh',
+  },
+}
+
+describe('maybeTranscribeVoice — local provider', () => {
+  test('transcribes without any API key', async () => {
+    let ranCmd = ''
+    let ranArgs: string[] = []
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        runLocal: async (cmd, args) => {
+          ranCmd = cmd
+          ranArgs = args
+          return { code: 0, stdout: '  привет, это тест  \n', stderr: '' }
+        },
+      },
+      localConfig,
+      {},
+    )
+    expect(r.status).toBe('ok')
+    expect(r.transcript).toBe('привет, это тест')
+    expect(ranCmd).toBe('/opt/whisper/transcribe.sh')
+    expect(ranArgs[0]).toBe('/tmp/voice.oga')
+  })
+
+  test('passes the configured language through to the command', async () => {
+    let ranArgs: string[] = []
+    await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        runLocal: async (_cmd, args) => {
+          ranArgs = args
+          return { code: 0, stdout: 'ok', stderr: '' }
+        },
+      },
+      localConfig,
+      {},
+    )
+    expect(ranArgs[1]).toBe('ru')
+  })
+
+  test('never calls Groq even when a key is present', async () => {
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        fetchImpl: (async () => {
+          throw new Error('groq must not be called when provider=local')
+        }) as unknown as typeof fetch,
+        runLocal: async () => ({ code: 0, stdout: 'local wins', stderr: '' }),
+      },
+      localConfig,
+      { GROQ_API_KEY: 'gsk_should_be_ignored' },
+    )
+    expect(r.status).toBe('ok')
+    expect(r.transcript).toBe('local wins')
+  })
+
+  test('returns failed with stderr when the command exits non-zero', async () => {
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        runLocal: async () => ({ code: 4, stdout: '', stderr: 'model missing: ggml-small.bin' }),
+      },
+      localConfig,
+      {},
+    )
+    expect(r.status).toBe('failed')
+    expect(r.errorMessage).toContain('4')
+    expect(r.errorMessage).toContain('model missing')
+  })
+
+  test('empty stdout means unintelligible audio, not a pipeline failure', async () => {
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        runLocal: async () => ({ code: 0, stdout: '   \n  ', stderr: '' }),
+      },
+      localConfig,
+      {},
+    )
+    expect(r.status).toBe('ok')
+    expect(r.transcript).toBe('')
+  })
+
+  test('returns failed when local_command is not configured', async () => {
+    const cfg: AppConfig = {
+      ...voiceConfig,
+      voice: { ...voiceConfig.voice, provider: 'local' },
+    }
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        downloadFile: async () => {
+          throw new Error('should not download without a command configured')
+        },
+      },
+      cfg,
+      {},
+    )
+    expect(r.status).toBe('failed')
+    expect(r.errorMessage).toContain('local_command')
+  })
+
+  test('propagates a thrown spawn error as failed', async () => {
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        downloadFile: async () => ({ path: '/tmp/voice.oga', size: 1000 }),
+        runLocal: async () => {
+          throw new Error('ENOENT: no such file')
+        },
+      },
+      localConfig,
+      {},
+    )
+    expect(r.status).toBe('failed')
+    expect(r.errorMessage).toContain('ENOENT')
+  })
+
+  test('still enforces the size guard before running anything', async () => {
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'big',
+        size: 30 * 1024 * 1024,
+        downloadFile: async () => {
+          throw new Error('should not download when oversized')
+        },
+        runLocal: async () => {
+          throw new Error('should not run when oversized')
+        },
+      },
+      localConfig,
+      {},
+    )
+    expect(r.status).toBe('skipped')
+    expect(r.errorMessage).toContain('file too large')
+  })
+})
