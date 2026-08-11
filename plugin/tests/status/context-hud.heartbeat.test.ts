@@ -93,7 +93,7 @@ describe('setHeartbeatSuffix (edit-only)', () => {
     await hud.setHeartbeatSuffix(OWNER, 'работаю: сборка · 12:00')
     expect(api.sent.length).toBe(1) // STILL only the lifecycle send
     const text = api.edited.at(-1)?.text ?? ''
-    expect(text).toContain('🧠 <b>Контекст</b>:')
+    expect(text).toContain('<pre>Контекст ')
     expect(text.endsWith('<i>работаю: сборка · 12:00</i>')).toBe(true)
   })
 

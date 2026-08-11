@@ -165,49 +165,73 @@ function emptyCount(text: string): number {
   return (text.match(/▱/g) ?? []).length
 }
 
+// The aligned meter block is the card's first element: a <pre> so Telegram
+// renders it monospaced and the columns actually line up.
+function meterBlock(text: string): string {
+  const start = text.indexOf('<pre>')
+  const end = text.indexOf('</pre>')
+  expect(start).toBe(0)
+  expect(end).toBeGreaterThan(start)
+  return text.slice(start + '<pre>'.length, end)
+}
+
 describe('renderHud', () => {
-  test('0% → 0 filled segments, 10 empty', () => {
+  test('0% → 0 filled segments, 8 empty', () => {
     const { text } = renderHud({ usedTokens: 0 }, WINDOW)
     expect(filledCount(text)).toBe(0)
-    expect(emptyCount(text)).toBe(10)
-    expect(text).toContain('0% (0k / 200k)')
+    expect(emptyCount(text)).toBe(8)
+    expect(text).toContain('0% 0k/200k')
   })
 
-  test('50% → 5 filled segments', () => {
+  test('50% → 4 filled segments', () => {
     const { text } = renderHud({ usedTokens: 100_000 }, WINDOW)
-    expect(filledCount(text)).toBe(5)
-    expect(emptyCount(text)).toBe(5)
-    expect(text).toContain('50% (100k / 200k)')
+    expect(filledCount(text)).toBe(4)
+    expect(emptyCount(text)).toBe(4)
+    expect(text).toContain('50% 100k/200k')
   })
 
-  test('57% → 6 filled segments (rounds 5.7)', () => {
+  test('57% → 5 filled segments (rounds 4.56)', () => {
     const { text } = renderHud({ usedTokens: 114_000 }, WINDOW)
-    expect(filledCount(text)).toBe(6)
-    expect(text).toContain('🧠 <b>Контекст</b>:')
-    expect(text).toContain('57% (114k / 200k)')
+    expect(filledCount(text)).toBe(5)
+    expect(meterBlock(text)).toContain('Контекст')
+    expect(text).toContain('57% 114k/200k')
   })
 
-  test('100% → 10 filled segments', () => {
+  test('100% → 8 filled segments', () => {
     const { text } = renderHud({ usedTokens: 200_000 }, WINDOW)
-    expect(filledCount(text)).toBe(10)
+    expect(filledCount(text)).toBe(8)
     expect(emptyCount(text)).toBe(0)
-    expect(text).toContain('100% (200k / 200k)')
+    expect(text).toContain('100% 200k/200k')
   })
 
   test('over 100% clamps to a full bar and 100%', () => {
     const { text } = renderHud({ usedTokens: 250_000 }, WINDOW)
-    expect(filledCount(text)).toBe(10)
-    expect(text).toContain('100% (250k / 200k)')
+    expect(filledCount(text)).toBe(8)
+    expect(text).toContain('100% 250k/200k')
   })
 
-  test('null usage → «Контекст: —», no bar', () => {
+  test('null usage → «Контекст —», no bar', () => {
     const { text } = renderHud(null, WINDOW)
-    expect(text).toContain('🧠 <b>Контекст</b>: —')
+    expect(meterBlock(text)).toBe('Контекст —')
     expect(filledCount(text)).toBe(0)
     expect(emptyCount(text)).toBe(0)
   })
 
-  test('model renders as an optional escaped second line', () => {
+  test('meter rows are column-aligned: label, bar and value start alike', () => {
+    const { text } = renderHud({ usedTokens: 100_000 }, WINDOW, undefined, {
+      todos: [todo('1', 'completed', 'a'), todo('2', 'in_progress', 'b')],
+    })
+    const rows = meterBlock(text).split('\n')
+    expect(rows).toHaveLength(2)
+    const [ctx, tasks] = rows as [string, string]
+    // Same bar column, same value column, and no row wider than 32 chars — the
+    // width a phone renders without wrapping the monospace block.
+    expect(ctx.indexOf('▰')).toBe(tasks.indexOf('▰'))
+    expect(ctx.indexOf('50%')).toBe(tasks.indexOf('1/2'))
+    for (const row of rows) expect(row.length).toBeLessThanOrEqual(32)
+  })
+
+  test('model renders as an optional escaped meta line', () => {
     const { text } = renderHud({ usedTokens: 100_000 }, WINDOW, 'claude-opus-4-8')
     expect(text).toContain('\n<i>claude-opus-4-8</i>')
     const escaped = renderHud(null, WINDOW, 'a<b>&c').text
@@ -217,8 +241,8 @@ describe('renderHud', () => {
   test('1M window: denominator renders «1M», pct against 1M', () => {
     // 151k of a 1M window ≈ 15% (was mis-reported as 76% against a 200k cap).
     const { text } = renderHud({ usedTokens: 151_000 }, 1_000_000, 'claude-fable-5')
-    expect(text).toContain('15% (151k / 1M)')
-    expect(filledCount(text)).toBe(2) // round(15/10) = 2 segments
+    expect(text).toContain('15% 151k/1M')
+    expect(filledCount(text)).toBe(1) // round(15/100*8) = 1 segment
   })
 
   test('keyboard shape: single Сжать row, no Новый диалог button', () => {
@@ -323,7 +347,7 @@ describe('ContextHud lifecycle', () => {
     const api = new FakeApi()
     const hud = makeHud(api, { usage: null })
     await hud.onSessionStart(OWNER)
-    expect(api.sent[0]!.text).toContain('🧠 <b>Контекст</b>: —')
+    expect(api.sent[0]!.text).toContain('<pre>Контекст —</pre>')
   })
 
   test('non-owner chat is a no-op', async () => {
@@ -448,8 +472,8 @@ describe('ContextHud model-from-transcript window', () => {
     })
     await hud.onSessionStart(OWNER)
     const text = api.sent[0]!.text
-    expect(text).toContain('/ 1M)') // denominator is the 1M window, not 200k
-    expect(text).toContain('15% (151k / 1M)')
+    expect(text).toContain('k/1M') // denominator is the 1M window, not 200k
+    expect(text).toContain('15% 151k/1M')
     expect(text).toContain('<i>claude-fable-5</i>') // model line rendered
   })
 
@@ -463,7 +487,7 @@ describe('ContextHud model-from-transcript window', () => {
     })
     await hud.onSessionStart(OWNER)
     const text = api.sent[0]!.text
-    expect(text).toContain('/ 1M)') // Fable (transcript) → 1M, not opus 200k
+    expect(text).toContain('k/1M') // Fable (transcript) → 1M, not opus 200k
     expect(text).toContain('<i>claude-fable-5</i>')
   })
 
@@ -475,7 +499,7 @@ describe('ContextHud model-from-transcript window', () => {
     })
     await hud.onSessionStart(OWNER)
     const text = api.sent[0]!.text
-    expect(text).toContain('/ 1M)') // hook Fable → 1M when transcript is silent
+    expect(text).toContain('k/1M') // hook Fable → 1M when transcript is silent
     expect(text).toContain('<i>claude-fable-5</i>')
   })
 
@@ -488,7 +512,7 @@ describe('ContextHud model-from-transcript window', () => {
     })
     await hud.onSessionStart(OWNER)
     const text = api.sent[0]!.text
-    expect(text).toContain('50% (150k / 300k)') // override 300k beats Fable 1M
+    expect(text).toContain('50% 150k/300k') // override 300k beats Fable 1M
   })
 
   test('no model anywhere → 200k fallback', async () => {
@@ -498,7 +522,7 @@ describe('ContextHud model-from-transcript window', () => {
       usage: { usedTokens: 100_000, pct: 0.5 }, // no transcript model
     })
     await hud.onSessionStart(OWNER)
-    expect(api.sent[0]!.text).toContain('50% (100k / 200k)')
+    expect(api.sent[0]!.text).toContain('50% 100k/200k')
   })
 })
 
@@ -669,7 +693,7 @@ describe('renderStatusTasks', () => {
     expect(renderStatusTasks([])).toBe('')
   })
 
-  test('bar reflects done/total and header carries the count', () => {
+  test('detail only: the bar and the count live in the meter block, not here', () => {
     const todos = [
       todo('1', 'completed', 'a'),
       todo('2', 'completed', 'b'),
@@ -678,10 +702,11 @@ describe('renderStatusTasks', () => {
       todo('5', 'pending', 'e'),
     ]
     const text = renderStatusTasks(todos)
-    expect(text).toContain('<b>Задачи</b>')
-    expect(text).toContain('3/5')
-    expect((text.match(/▰/g) ?? []).length).toBe(6) // round(3/5*10)
-    expect((text.match(/▱/g) ?? []).length).toBe(4)
+    expect(text.startsWith('<blockquote expandable>')).toBe(true)
+    expect(text).not.toContain('<b>Задачи</b>')
+    expect(text).not.toContain('3/5')
+    expect(text).not.toContain('▰')
+    expect(text).not.toContain('▱')
   })
 
   test('in-progress uses activeForm; content is escaped and truncated', () => {
@@ -714,16 +739,14 @@ describe('renderStatusTasks', () => {
     expect(text).toContain('<i>+2 завершено ранее</i>')
   })
 
-  test('detail lives in an expandable blockquote; header stays outside', () => {
+  test('detail lives in an expandable blockquote', () => {
     const text = renderStatusTasks([
       todo('1', 'completed', 'done-a'),
       todo('2', 'in_progress', 'now', 'Doing X'),
       todo('3', 'pending', 'later'),
     ])
     const qi = text.indexOf('<blockquote expandable>')
-    expect(qi).toBeGreaterThan(-1)
-    // header (bar + count) is before the quote, not inside it
-    expect(text.slice(0, qi)).toContain('<b>Задачи</b>')
+    expect(qi).toBe(0)
     expect(text.endsWith('</blockquote>')).toBe(true)
     // per-task detail is inside the collapsible quote
     const inside = text.slice(qi)
@@ -751,21 +774,31 @@ describe('renderStatusTasks budget', () => {
 })
 
 describe('renderHud work view', () => {
-  test('permissionMode plan → «режим: план»; other → «выполнение»; absent → no line', () => {
+  test('permissionMode joins the meta line: «план» / «выполнение»; absent → omitted', () => {
     const plan = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [], permissionMode: 'plan' })
-    expect(plan.text).toContain('<i>режим: план</i>')
+    expect(plan.text).toContain('<i>m · план</i>')
     const exec = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [], permissionMode: 'acceptEdits' })
-    expect(exec.text).toContain('<i>режим: выполнение</i>')
+    expect(exec.text).toContain('<i>m · выполнение</i>')
     const none = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [] })
-    expect(none.text).not.toContain('режим:')
+    expect(none.text).toContain('<i>m</i>')
+    expect(none.text).not.toContain('выполнение')
   })
 
-  test('todos append a «Задачи» section; empty todos omit it', () => {
+  test('freshness joins the meta line instead of a «Задачи» header', () => {
+    const { text } = renderHud({ usedTokens: 0 }, WINDOW, 'm', {
+      todos: [todo('1', 'in_progress', 'работаю')],
+      permissionMode: 'plan',
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    expect(text).toContain('<i>m · план · сверено меньше минуты назад</i>')
+  })
+
+  test('todos add a «Задачи» meter row + detail; empty todos omit both', () => {
     const withTasks = renderHud({ usedTokens: 0 }, WINDOW, undefined, {
       todos: [todo('1', 'in_progress', 'работаю')],
     })
-    expect(withTasks.text).toContain('\n\n<b>Задачи</b>')
-    expect(withTasks.text).toContain('◐ работаю')
+    expect(meterBlock(withTasks.text)).toContain('Задачи')
+    expect(withTasks.text).toContain('<blockquote expandable>◐ работаю')
     const without = renderHud({ usedTokens: 0 }, WINDOW)
     expect(without.text).not.toContain('Задачи')
   })
@@ -862,7 +895,7 @@ describe('ContextHud onTodoEvent', () => {
     }
     await hud.onTodoEvent(OWNER, event)
     const last = api.edited[api.edited.length - 1]!
-    expect(last.text).toContain('<b>Задачи</b>')
+    expect(last.text).toContain('Задачи   ')
     expect(last.text).toContain('◐ шаг один')
     expect(last.text).toContain('◻ шаг два')
     expect(last.text).toContain('0/2')
@@ -969,7 +1002,7 @@ describe('applyReconciledView', () => {
       freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
     })
     const text = api.sent.length > 0 ? api.sent[0]!.text : api.edited[api.edited.length - 1]!.text
-    expect(text).toContain('<b>Задачи</b> · <i>сверено меньше минуты назад</i>')
+    expect(text).toContain('<i>opus · сверено меньше минуты назад</i>')
     expect(text).toContain('живая задача')
   })
 
@@ -993,8 +1026,8 @@ describe('applyReconciledView', () => {
       freshness: { kind: 'unverified' },
     })
     const text = api.sent[0]!.text
-    expect(text).toContain('<b>Задачи — НЕ СВЕРЕНО</b>')
-    expect(text).toContain('Показаны только события инструментов')
+    expect(text).toContain('<b>НЕ СВЕРЕНО</b></i>')
+    expect(text).toContain('◻ только событие')
   })
 })
 
@@ -1201,7 +1234,7 @@ describe('ContextHud — model-aware window', () => {
     const hud = hudWith(api, s.reader)
     await hud.onSessionStart(OWNER)
     // 100k / 1M = 10%.
-    expect(api.sent[0]!.text).toContain("10% (100k / 1M)")
+    expect(api.sent[0]!.text).toContain("10% 100k/1M")
   })
 
   test("mid-session model switch (Opus → Fable) moves the denominator", async () => {
@@ -1210,12 +1243,12 @@ describe('ContextHud — model-aware window', () => {
     const hud = hudWith(api, s.reader)
     await hud.onSessionStart(OWNER)
     // 100k / 200k = 50%.
-    expect(api.sent[0]!.text).toContain("50% (100k / 200k)")
+    expect(api.sent[0]!.text).toContain("50% 100k/200k")
 
     s.set("claude-fable-5")
     await hud.onStop(OWNER)
     // Same used tokens, now against 1M → 10%.
-    expect(api.edited[api.edited.length - 1]!.text).toContain("10% (100k / 1M)")
+    expect(api.edited[api.edited.length - 1]!.text).toContain("10% 100k/1M")
   })
 
   test("unknown model falls back to the 200k default", async () => {
@@ -1223,7 +1256,7 @@ describe('ContextHud — model-aware window', () => {
     const s = mutableSession({ transcriptPath: "/t/a.jsonl", model: "gpt-5" })
     const hud = hudWith(api, s.reader)
     await hud.onSessionStart(OWNER)
-    expect(api.sent[0]!.text).toContain("50% (100k / 200k)")
+    expect(api.sent[0]!.text).toContain("50% 100k/200k")
   })
 
   test("explicit override wins over the model table", async () => {
@@ -1232,7 +1265,7 @@ describe('ContextHud — model-aware window', () => {
     const hud = hudWith(api, s.reader, 500_000)
     await hud.onSessionStart(OWNER)
     // Override 500k beats Fable 1M: 100k / 500k = 20%.
-    expect(api.sent[0]!.text).toContain("20% (100k / 500k)")
+    expect(api.sent[0]!.text).toContain("20% 100k/500k")
   })
 })
 
@@ -1294,7 +1327,7 @@ describe('ContextHud autonomy integration', () => {
     const hud = makeHud(api, { dir })
     await hud.onSessionStart(OWNER)
     expect(api.sent.length).toBe(1)
-    expect(api.sent[0]!.text).toContain('🧠 <b>Контекст</b>:')
+    expect(api.sent[0]!.text).toContain('<pre>Контекст ')
     expect(api.sent[0]!.text).not.toContain('Мандат:')
   })
 })

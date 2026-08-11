@@ -6,7 +6,7 @@ import {
   bucketAge,
   formatUtcHm,
   renderFreshnessHeader,
-  type TaskFreshness,
+  renderFreshnessInline,
 } from '../../src/status/task-freshness.js'
 import { renderStatusTasks } from '../../src/status/context-hud.js'
 import { renderTodoList } from '../../src/status/task-mirror.js'
@@ -85,20 +85,36 @@ const todos: TodoItem[] = [
   { id: '2', content: 'Ship', status: 'pending' },
 ]
 
+describe('renderFreshnessInline — the HUD meta-line form', () => {
+  test('fresh: relative age, minute-bucketed', () => {
+    expect(renderFreshnessInline({ kind: 'fresh', reconciledAgeMs: 5_000 }))
+      .toBe('сверено меньше минуты назад')
+    expect(renderFreshnessInline({ kind: 'fresh', reconciledAgeMs: 130_000 }))
+      .toBe('сверено 2 мин назад')
+  })
+  test('stale: bold alarm + both ages', () => {
+    expect(renderFreshnessInline({ kind: 'stale', reconciledAgeMs: 120_000, eventAgeMs: 30_000 }))
+      .toBe('<b>ДАННЫЕ УСТАРЕЛИ</b> · сверено 2 мин назад · событие меньше минуты назад')
+  })
+  test('unverified: bold alarm', () => {
+    expect(renderFreshnessInline({ kind: 'unverified' })).toBe('<b>НЕ СВЕРЕНО</b>')
+  })
+  test('ended: frozen label, with the UTC stamp when there was a reconciliation', () => {
+    expect(renderFreshnessInline({ kind: 'ended', reconciledAtLabel: '09:00' }))
+      .toBe('сессия завершена · сверено 09:00 UTC')
+    expect(renderFreshnessInline({ kind: 'ended', reconciledAtLabel: null }))
+      .toBe('сессия завершена')
+  })
+  test('expired: frozen label', () => {
+    expect(renderFreshnessInline({ kind: 'expired' })).toBe('данные не обновляются')
+  })
+})
+
 describe('surface embedding — context HUD', () => {
-  const fresh: TaskFreshness = { kind: 'fresh', reconciledAgeMs: 5_000 }
-  test('renderStatusTasks uses the freshness label in place of «Задачи»', () => {
-    const out = renderStatusTasks(todos, fresh)
-    expect(out.startsWith('<b>Задачи</b> · <i>сверено меньше минуты назад</i> ')).toBe(true)
-    expect(out).toContain('0/2') // done/total bar counts still present
-  })
-  test('stale subline is rendered above the blockquote', () => {
-    const out = renderStatusTasks(todos, { kind: 'stale', reconciledAgeMs: 120_000, eventAgeMs: 30_000 })
-    expect(out).toContain('<b>Задачи — ДАННЫЕ УСТАРЕЛИ</b>')
-    expect(out).toContain('<i>сверено 2 мин назад · событие меньше минуты назад</i>')
-  })
-  test('no freshness → legacy «Задачи» header (back-compat)', () => {
-    expect(renderStatusTasks(todos).startsWith('<b>Задачи</b> ')).toBe(true)
+  test('renderStatusTasks renders detail only — freshness moved to the meta line', () => {
+    const out = renderStatusTasks(todos)
+    expect(out.startsWith('<blockquote expandable>')).toBe(true)
+    expect(out).not.toContain('Задачи')
   })
 })
 

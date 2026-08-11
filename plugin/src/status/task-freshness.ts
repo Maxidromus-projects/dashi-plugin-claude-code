@@ -59,6 +59,35 @@ export function formatUtcHm(epochMs: number): string {
 }
 
 /**
+ * Render the freshness state as ONE inline phrase for the HUD's meta line
+ * («модель · режим · <freshness>»). The pinned card carries no «Задачи» header
+ * any more — its bar and count live in the aligned meter block — so the
+ * indicator has to survive as a single compact string. Alarm states keep their
+ * shouting bold; the calm ones are plain text (the caller italicises the line).
+ *
+ * Same wording as renderFreshnessHeader, same minute bucketing — so the
+ * surfaces still speak one language and the hash-dedup keeps edits at ~1/min.
+ */
+export function renderFreshnessInline(f: TaskFreshness): string {
+  switch (f.kind) {
+    case 'fresh':
+      return f.reconciledAgeMs < 60_000
+        ? 'сверено меньше минуты назад'
+        : `сверено ${bucketAge(f.reconciledAgeMs)} назад`
+    case 'stale':
+      return `<b>ДАННЫЕ УСТАРЕЛИ</b> · сверено ${bucketAge(f.reconciledAgeMs)} назад · событие ${bucketAge(f.eventAgeMs)} назад`
+    case 'unverified':
+      return '<b>НЕ СВЕРЕНО</b>'
+    case 'ended':
+      return f.reconciledAtLabel !== null
+        ? `сессия завершена · сверено ${f.reconciledAtLabel} UTC`
+        : 'сессия завершена'
+    case 'expired':
+      return 'данные не обновляются'
+  }
+}
+
+/**
  * Render the freshness state into a label (+ optional subline). Exact strings
  * are contractually stable (M3 brief §4) — tests assert on them verbatim.
  */
