@@ -29,6 +29,8 @@ import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import type { StatusManager } from '../status/status-manager.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
+import { getChatPolicy } from '../chats/policy-loader.js'
+import { appendChatTranscript } from '../chats/transcript.js'
 import type { MultichatRouter } from '../router/multichat-router.js'
 import type { InboundMessage } from '../router/inbox-bridge.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
@@ -173,6 +175,13 @@ export interface HandlerDeps {
   // sendChannelNotification path. Absent in legacy single-chat
   // deployments — handlers fall back to the historical MCP notify path.
   router?: MultichatRouter
+  // Multichat state root (2026-09-01) — `config.multichat.state_dir`,
+  // the directory that owns `chats/{chatId}/{inbox,outbox}`. Needed by
+  // the passive transcript so its `chats/{chatId}/transcript/` sits
+  // next to the router's per-chat dirs instead of opening a second
+  // chats-tree under the plugin state root. Absent in legacy wiring /
+  // tests — then `statePaths.root` is used as the fallback.
+  multichatStateDir?: string
   // Multichat policy. Drives gate.ts group-chat allowlist, addressing
   // mention_allowlist, and per-chat behaviour. MUST be paired with
   // `router` to flip the dispatch path; passing one without the other
@@ -409,6 +418,51 @@ function buildMeta(
   return meta
 }
 
+// Passive transcript tap (2026-09-01). Chats with `passive_log: true`
+// in policy.yaml get EVERY message written to
+// `{multichatStateDir}/chats/{chatId}/transcript/{YYYY-MM-DD}.jsonl`,
+// addressed or not. Motivation: the sales group posts its daily reports
+// there and the bot must be able to read them back later — while still
+// never answering them. Runs AFTER the gate (un-allowlisted senders are
+// already gone) and BEFORE the addressing drop, so the transcript has no
+// holes. Group/supergroup only: DMs already land in a session transcript.
+// Never throws — appendChatTranscript swallows and logs its own failures.
+async function recordPassiveTranscript(
+  ctx: Context,
+  deps: HandlerDeps,
+  chatId: string,
+  senderId: string,
+  kind: string,
+  addressed: boolean,
+): Promise<void> {
+  const chatType = ctx.chat?.type
+  if (chatType !== 'group' && chatType !== 'supergroup') return
+  if (!deps.policy) return
+  if (getChatPolicy(deps.policy, chatId)?.passive_log !== true) return
+
+  const msg = ctx.message
+  const from = msg?.from
+  const name = [from?.first_name, from?.last_name].filter(Boolean).join(' ')
+  // Telegram stamps `date` in whole seconds; fall back to receive time
+  // for the (theoretical) update that arrives without one.
+  const tsMs = msg?.date !== undefined ? msg.date * 1000 : Date.now()
+  await appendChatTranscript(
+    deps.multichatStateDir ?? deps.statePaths.root,
+    {
+      ts: new Date(tsMs).toISOString(),
+      chat_id: chatId,
+      user_id: senderId,
+      ...(from?.username !== undefined ? { username: from.username } : {}),
+      ...(name !== '' ? { name } : {}),
+      ...(msg?.message_id !== undefined ? { message_id: msg.message_id } : {}),
+      kind,
+      text: msg?.text ?? msg?.caption ?? '',
+      addressed,
+    },
+    deps.log,
+  )
+}
+
 // Common gate+notify body. Each per-kind handler computes its primary text
 // and (in T8+) a list of MediaDescriptors via buildMedia. We render the
 // descriptors and feed them to buildChannelContent so the agent sees
@@ -443,6 +497,16 @@ async function gateAndNotify(
   // private chats regardless of the allowlist parameter.
   if (deps.policy && input.chatType !== 'private') {
     const addressed = isAddressedToBot(ctx, deps.policy.mention_allowlist)
+    // passive_log tap — records addressed AND non-addressed messages, so
+    // it must sit above the drop below.
+    await recordPassiveTranscript(
+      ctx,
+      deps,
+      decision.chatId,
+      decision.senderId,
+      kind,
+      addressed,
+    )
     if (!addressed) {
       deps.log.debug('handlers.not_addressed', {
         chat_id: decision.chatId,
