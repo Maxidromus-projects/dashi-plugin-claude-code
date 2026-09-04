@@ -36,6 +36,7 @@ import type { InboundMessage } from '../router/inbox-bridge.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import { gateTelegramMessage, type GateInput } from './gate.js'
 import { isAddressedToBot } from './addressing.js'
+import { appendHiddenLinks } from './hidden-links.js'
 import {
   buildChannelContent,
   type BotIdentity,
@@ -553,6 +554,12 @@ async function gateAndNotify(
   const descriptors = buildMedia ? await buildMedia() : []
   const renderedMedia = descriptors.map(renderMediaDescriptor)
 
+  // Ссылка, спрятанная под словом («смотри тут»), в тексте отсутствует --
+  // телеграм держит её отдельным полем. Дописываем такие адреса строкой ниже
+  // текста: см. src/telegram/hidden-links.ts. Сам текст не подменяем, на него
+  // смотрят и разбор команд, и проверка упоминания бота.
+  const textWithLinks = (): string => appendHiddenLinks(buildText(), ctx.message)
+
   // Router path: route GROUP/supergroup chats to their per-chat tmux
   // session via the file-based inbox. Private DMs deliberately fall
   // through to the legacy sendChannelNotification path below so they
@@ -603,7 +610,7 @@ async function gateAndNotify(
       : undefined
 
     const inboundMsg: InboundMessage = {
-      text: buildText(),
+      text: textWithLinks(),
       chat_id: decision.chatId,
       user_id: decision.senderId,
       user:
@@ -644,7 +651,7 @@ async function gateAndNotify(
   // single-chat (DM-only) wiring; will be removed once all deployments
   // run multichat.
   const content = buildChannelContent({
-    text: buildText(),
+    text: textWithLinks(),
     bot: deps.bot,
     ...(ctx.message?.reply_to_message
       ? { reply: adaptReply(ctx.message.reply_to_message)! }
