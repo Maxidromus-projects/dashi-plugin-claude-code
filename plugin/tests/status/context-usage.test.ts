@@ -28,6 +28,23 @@ function assistantLine(
   })
 }
 
+// The `compact_boundary` system record Claude Code writes when a session is
+// compacted. Shape verified against a real transcript (2026-08-08): a `system`
+// line with `subtype: 'compact_boundary'` and a `compactMetadata` object whose
+// `postTokens` is the context size AFTER compaction.
+function compactBoundaryLine(
+  metadata: Record<string, unknown>,
+  opts: { isSidechain?: boolean } = {},
+): string {
+  return JSON.stringify({
+    type: 'system',
+    subtype: 'compact_boundary',
+    isSidechain: opts.isSidechain ?? false,
+    content: 'Conversation compacted',
+    compactMetadata: { trigger: 'manual', ...metadata },
+  })
+}
+
 function userLine(text: string): string {
   return JSON.stringify({
     type: 'user',
@@ -255,6 +272,66 @@ describe('computeContextUsage', () => {
   test('model with surrounding whitespace → trimmed value', () => {
     const lines = [assistantLine({ input_tokens: 50000 }, { model: '  claude-fable-5 \n' })]
     expect(computeContextUsage(lines, 200000)?.model).toBe('claude-fable-5')
+  })
+
+  // ─── Compaction boundary ───────────────────────────────────────────
+  // A /compact writes a `compact_boundary` system record and NO assistant
+  // turn. Scanning past it would report the PRE-compact window until the
+  // next turn ends — the pinned card froze at «87%» right after the user
+  // pressed «Сжать» (reported 2026-08-08). `postTokens` is the authoritative
+  // post-compaction size, so the boundary is a hard stop for the scan.
+  test('compact boundary after the last turn → postTokens, not the stale usage', () => {
+    const lines = [
+      assistantLine({ input_tokens: 174811 }),
+      compactBoundaryLine({ preTokens: 175193, postTokens: 14805 }),
+    ]
+    expect(computeContextUsage(lines, 200000)).toEqual({
+      usedTokens: 14805,
+      pct: 14805 / 200000,
+    })
+  })
+
+  test('compact boundary keeps the model of the newest turn before it', () => {
+    const lines = [
+      assistantLine({ input_tokens: 174811 }, { model: 'claude-opus-5' }),
+      compactBoundaryLine({ postTokens: 14805 }),
+    ]
+    expect(computeContextUsage(lines, 200000)?.model).toBe('claude-opus-5')
+  })
+
+  test('a turn AFTER the boundary wins over it', () => {
+    const lines = [
+      assistantLine({ input_tokens: 174811 }),
+      compactBoundaryLine({ postTokens: 14805 }),
+      assistantLine({ input_tokens: 55678 }),
+    ]
+    expect(computeContextUsage(lines, 200000)?.usedTokens).toBe(55678)
+  })
+
+  test('boundary without a usable postTokens → fall through to the older turn', () => {
+    for (const bad of [undefined, 0, -1, 'x', null]) {
+      const lines = [
+        assistantLine({ input_tokens: 120000 }),
+        compactBoundaryLine({ postTokens: bad }),
+      ]
+      expect(computeContextUsage(lines, 200000)?.usedTokens).toBe(120000)
+    }
+  })
+
+  test('a sidechain compact boundary is ignored', () => {
+    const lines = [
+      assistantLine({ input_tokens: 120000 }),
+      compactBoundaryLine({ postTokens: 14805 }, { isSidechain: true }),
+    ]
+    expect(computeContextUsage(lines, 200000)?.usedTokens).toBe(120000)
+  })
+
+  test('boundary as the only line → its postTokens', () => {
+    const lines = [compactBoundaryLine({ postTokens: 13540 })]
+    expect(computeContextUsage(lines, 200000)).toEqual({
+      usedTokens: 13540,
+      pct: 13540 / 200000,
+    })
   })
 })
 

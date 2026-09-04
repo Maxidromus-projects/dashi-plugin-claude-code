@@ -33,7 +33,7 @@ import {
   type ContextUsage,
 } from './context-usage.js'
 import { applyTaskCreateToMap, applyTaskUpdateToMap } from './task-mirror.js'
-import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
+import { renderFreshnessInline, type TaskFreshness } from './task-freshness.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
 import type { TodoItem } from '../schemas.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../channel/tools.js'
@@ -49,9 +49,18 @@ export const HUD_PREFIX = 'hud:'
 // Pure rendering helper (unit-tested in isolation).
 // ─────────────────────────────────────────────────────────────────────
 
-const BAR_SEGMENTS = 10
+// Meter geometry. 8 segments (not 10) so a full row —
+// «Контекст ▰▰▱▱▱▱▱▱  23% 234k/1M» — stays ≤32 chars: a Telegram <pre> block
+// does NOT scroll horizontally, it WRAPS, and a wrapped meter row is exactly
+// the ragged look this layout exists to kill (owner screenshot 2026-08-11).
+const BAR_SEGMENTS = 8
 const BAR_FILLED = '▰'
 const BAR_EMPTY = '▱'
+// Column widths for the aligned meter block: the longest label («Контекст»)
+// and the widest calm value («100%»). A wider value (e.g. «12/25») just
+// overflows its column — nothing follows it on the tasks row.
+const METER_LABEL_WIDTH = 8
+const METER_VALUE_WIDTH = 4
 
 // bump() debounce window — collapses inbound-message bursts (multi-part voice,
 // albums) into a single delete+resend. Mirrors TmuxMirror.BUMP_DEBOUNCE_MS.
@@ -118,34 +127,21 @@ function taskLine(todo: TodoItem): string {
 }
 
 /**
- * Render the compact «Задачи» section for the status pin: a 10-segment
- * done/total bar + in-progress / pending / last-completed lines.
+ * Render the collapsible task DETAIL for the status pin: in-progress / pending
+ * / last-completed lines inside an <blockquote expandable>.
  * Empty todos → empty string (the HUD omits the section entirely).
- * PURE — exported for unit tests.
+ *
+ * The progress bar, the done/total count and the freshness indicator are NOT
+ * here: the bar and count belong to the aligned meter block at the top of the
+ * card (renderMeterBlock) and the freshness to its meta line, so both meters
+ * line up in one monospace column instead of trailing two headers of different
+ * widths. PURE — exported for unit tests.
  */
-export function renderStatusTasks(
-  todos: ReadonlyArray<TodoItem>,
-  freshness?: TaskFreshness,
-): string {
+export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   if (todos.length === 0) return ''
   const inProgress = todos.filter((t) => t.status === 'in_progress')
   const pending = todos.filter((t) => t.status === 'pending')
   const completed = todos.filter((t) => t.status === 'completed')
-  const total = todos.length
-  const done = completed.length
-
-  const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round((done / total) * BAR_SEGMENTS)))
-  const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
-
-  // The header (bar + count) stays OUTSIDE the collapsible quote so progress is
-  // always visible when collapsed; the per-task detail goes INSIDE an
-  // <blockquote expandable>, so the pin reads «progress — tap to expand the list».
-  // M3: when a freshness indicator is supplied the bold «Задачи» label is
-  // replaced by the freshness label (+ optional subline), so the pin shows how
-  // recently the list was reconciled against the real pane.
-  const fh = freshness !== undefined ? renderFreshnessHeader(freshness) : { label: '<b>Задачи</b>' }
-  const header = `${fh.label} ${bar} ${done}/${total}`
-  const subLine = 'sub' in fh && fh.sub !== undefined ? `\n${fh.sub}` : ''
 
   const detail: string[] = []
   for (const t of inProgress) detail.push(taskLine(t))
@@ -159,10 +155,10 @@ export function renderStatusTasks(
   for (const t of visibleDone) detail.push(taskLine(t))
 
   // Total-budget pass: the per-category caps bound pending/completed but not
-  // in-progress, and escaping expands after the per-line cut. The header is
-  // always kept (counted first); drop overflowing detail lines, mark the cut.
+  // in-progress, and escaping expands after the per-line cut. Drop overflowing
+  // detail lines, mark the cut.
   const out: string[] = []
-  let used = header.length + subLine.length
+  let used = 0
   let dropped = 0
   for (const line of detail) {
     if (used + 1 + line.length <= TASKS_MAX_CHARS) {
@@ -174,8 +170,20 @@ export function renderStatusTasks(
   }
   if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
 
-  if (out.length === 0) return `${header}${subLine}`
-  return `${header}${subLine}\n<blockquote expandable>${out.join('\n')}</blockquote>`
+  if (out.length === 0) return ''
+  return `<blockquote expandable>${out.join('\n')}</blockquote>`
+}
+
+// One aligned meter row: «<label> <bar> <value>» in fixed columns. Rendered
+// inside a <pre> so Telegram uses a monospace font and the columns actually
+// line up on the owner's phone.
+function meterRow(label: string, bar: string, value: string): string {
+  return `${label.padEnd(METER_LABEL_WIDTH)} ${bar} ${value.padStart(METER_VALUE_WIDTH)}`
+}
+
+function meterBar(fraction: number): string {
+  const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(fraction * BAR_SEGMENTS)))
+  return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 }
 
 // «план» is the only mode worth naming; every other Claude Code permission
@@ -187,15 +195,21 @@ function modeLabel(permissionMode: string): string {
 /**
  * Render the HUD text + keyboard from a context-usage reading.
  *
- * text (HTML): `🧠 <b>Контекст</b>: <bar> <pct>% (<used>k / <window>k)` where
- * `<bar>` is a 10-segment meter (`▰` filled / `▱` empty) proportional to the
- * clamped percentage. An optional second line shows the model when known.
- * A null usage (no transcript / no usable turn yet) renders `🧠 <b>Контекст</b>: —`.
+ * Layout (owner directive 2026-08-11 — «подровнять все строки»): the card opens
+ * with ONE monospace <pre> block holding every meter, so the bars and their
+ * numbers sit in the same columns instead of trailing labels of different
+ * widths:
  *
- * With a `work` view the card grows a mode line («режим: план» /
- * «выполнение», only when the permission mode is known) and a compact
- * «Задачи» section (renderStatusTasks) — the combined status pin the
- * warchief asked for on 2026-07-04: ONE pinned message = context + work.
+ *   Контекст ▰▰▱▱▱▱▱▱  23% 234k/1M
+ *   Задачи   ▰▰▰▱▱▱▱▱  1/3
+ *
+ * Everything that is not a meter collapses into ONE italic meta line below it
+ * («<model> · <режим> · <свежесть>»), then the optional autonomy line, then the
+ * collapsible task detail. A null usage (no transcript / no usable turn yet)
+ * renders the context row as «Контекст —».
+ *
+ * The «Задачи» row appears only when there are todos — its bar is the
+ * done/total share, mirroring the context bar's fill.
  *
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
@@ -207,34 +221,44 @@ export function renderHud(
   autonomyLine?: string,
 ): { text: string; keyboard: InlineKeyboardLike } {
   const keyboard = buildHudKeyboard()
-  const modelLine = model !== undefined && model.length > 0 ? `\n<i>${escapeHtml(model)}</i>` : ''
-  const modeLine =
-    work?.permissionMode !== undefined && work.permissionMode.length > 0
-      ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
-      : ''
+
+  // ── meter block ──────────────────────────────────────────────────
+  const rows: string[] = []
+  if (usage === null) {
+    rows.push(`${'Контекст'.padEnd(METER_LABEL_WIDTH)} —`)
+  } else {
+    const windowLabel = formatWindowTokens(windowTokens)
+    const usedK = Math.round(usage.usedTokens / 1000)
+    const rawPct = windowTokens > 0 ? (usage.usedTokens / windowTokens) * 100 : 0
+    // Clamp to 0..100 for BOTH the bar and the displayed percentage so an
+    // over-full window (used > window) reads as a saturated 100%, never >100%.
+    const pct = Math.max(0, Math.min(100, Math.round(rawPct)))
+    rows.push(`${meterRow('Контекст', meterBar(pct / 100), `${pct}%`)} ${usedK}k/${windowLabel}`)
+  }
+  const todos = work?.todos ?? []
+  if (todos.length > 0) {
+    const done = todos.filter((t) => t.status === 'completed').length
+    rows.push(meterRow('Задачи', meterBar(done / todos.length), `${done}/${todos.length}`))
+  }
+
+  // ── meta line: model · mode · freshness ──────────────────────────
+  const meta: string[] = []
+  if (model !== undefined && model.length > 0) meta.push(escapeHtml(model))
+  if (work?.permissionMode !== undefined && work.permissionMode.length > 0) {
+    meta.push(modeLabel(work.permissionMode))
+  }
+  if (work?.freshness !== undefined) meta.push(renderFreshnessInline(work.freshness))
+  const metaLine = meta.length > 0 ? `\n<i>${meta.join(' · ')}</i>` : ''
+
   // Autonomy pin line (PR-1): one compact line when active mandates / open
   // owner questions exist. Already HTML-escaped by buildAutonomyHudLine (the
   // HUD passes escapeHtml), so it is safe under the card's HTML parse mode.
   const autonomyBlock =
     autonomyLine !== undefined && autonomyLine.length > 0 ? `\n${autonomyLine}` : ''
-  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos, work.freshness) : ''
-  const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
-  const tail = `${modelLine}${modeLine}${autonomyBlock}${tasksSection}`
+  const tasksBlock = renderStatusTasks(todos)
+  const tasksSection = tasksBlock.length > 0 ? `\n${tasksBlock}` : ''
 
-  if (usage === null) {
-    return { text: `🧠 <b>Контекст</b>: —${tail}`, keyboard }
-  }
-
-  const windowLabel = formatWindowTokens(windowTokens)
-  const usedK = Math.round(usage.usedTokens / 1000)
-  const rawPct = windowTokens > 0 ? (usage.usedTokens / windowTokens) * 100 : 0
-  // Clamp to 0..100 for BOTH the bar and the displayed percentage so an
-  // over-full window (used > window) reads as a saturated 100%, never >100%.
-  const pct = Math.max(0, Math.min(100, Math.round(rawPct)))
-  const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(pct / 10)))
-  const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
-
-  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowLabel})${tail}`
+  const text = `<pre>${rows.join('\n')}</pre>${metaLine}${autonomyBlock}${tasksSection}`
   return { text, keyboard }
 }
 
@@ -585,7 +609,11 @@ export class ContextHud {
     // is minute-bucketed, so most ticks change NOTHING in the rendered section.
     // Skip the whole refresh when the rendered «Задачи» section is identical to
     // the previously applied one — no editMessageText per tick.
-    const renderKey = `${view.sessionId}|${renderStatusTasks(view.todos, view.freshness)}`
+    // The freshness is no longer part of the task section (it moved to the meta
+    // line), so it has to enter the key explicitly — otherwise a fresh→stale
+    // transition would be deduped away and the pin would keep claiming the data
+    // was just reconciled.
+    const renderKey = `${view.sessionId}|${renderFreshnessInline(view.freshness)}|${renderStatusTasks(view.todos)}`
     if (this.lastReconciledRender.get(chatId) === renderKey) return Promise.resolve()
     this.lastReconciledRender.set(chatId, renderKey)
     return this.updateNow(chatId)

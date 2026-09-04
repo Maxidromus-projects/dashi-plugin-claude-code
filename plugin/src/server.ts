@@ -1316,6 +1316,10 @@ const handlerDeps: HandlerDeps = {
   // (handlers.ts treats the pair atomically).
   ...(multichatRouter !== undefined ? { router: multichatRouter } : {}),
   ...(multichatPolicy !== undefined ? { policy: multichatPolicy } : {}),
+  // passive_log transcripts live under the SAME root as the router's
+  // per-chat inbox/outbox dirs (`{state_dir}/chats/{chatId}/…`), which
+  // is not `statePaths.root` in a normal deploy.
+  ...(multichatStateDir !== undefined ? { multichatStateDir } : {}),
   // PRX-1 TASK-2: ask UI consumes follow-up `Другое` text replies BEFORE
   // the permission-reply short-circuit. Always wired — feature gate lives
   // inside the relay itself (callbacks no-op when no pending request).

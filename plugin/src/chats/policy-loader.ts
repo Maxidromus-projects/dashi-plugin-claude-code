@@ -42,6 +42,16 @@ export const ChatPolicySchema = z
     persona_file: z.string().min(1),
     handoff_file: z.string().min(1),
     deny: DenyRulesSchema.optional(),
+    // passive_log (2026-09-01): record EVERY message seen in this chat
+    // to `{stateDir}/chats/{chatId}/transcript/{YYYY-MM-DD}.jsonl`,
+    // including the ones the bot is not allowed to answer. Motivation:
+    // the sales group posts daily reports the bot must be able to read
+    // back later, while still never replying to them. Absent ⇒ OFF, so
+    // every pre-existing chat keeps its current behaviour. Optional
+    // rather than `.default(false)` on purpose: a default would make
+    // the inferred `ChatPolicy` type require the field at every
+    // construction site.
+    passive_log: z.boolean().optional(),
     system_reminder: z.string(),
     idle_ttl_ms: z.number().int().positive().default(1_800_000),
     max_queue_depth: z.number().int().positive().default(1),

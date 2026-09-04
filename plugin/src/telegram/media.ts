@@ -226,12 +226,73 @@ export interface VoiceTranscriptionInput {
   fetchImpl?: typeof fetch
   // Optional file-reader override so unit tests can avoid touching disk.
   readFile?: (path: string) => Promise<Uint8Array>
+  // Optional runner override for provider='local'. Production spawns the
+  // configured command; tests stub it so no binary is required.
+  runLocal?: (
+    command: string,
+    args: string[],
+  ) => Promise<{ code: number; stdout: string; stderr: string }>
 }
 
 export interface VoiceTranscriptionResult {
   transcript?: string
   status: 'ok' | 'missing_key' | 'failed' | 'skipped'
   errorMessage?: string
+}
+
+// provider='local' — hand the downloaded file to a local transcriber and
+// read the transcript off stdout. No key, no network, no upload.
+async function transcribeLocally(
+  input: VoiceTranscriptionInput,
+  config: AppConfig,
+): Promise<VoiceTranscriptionResult> {
+  const command = config.voice.local_command
+  if (!command) {
+    return {
+      status: 'failed',
+      errorMessage: "voice.provider is 'local' but voice.local_command is not configured",
+    }
+  }
+
+  // Same pre-download size guard as the Groq path: a wildly oversized file
+  // is a bad input regardless of who does the transcribing.
+  if (input.size !== undefined && input.size > GROQ_MAX_BYTES) {
+    return {
+      status: 'skipped',
+      errorMessage: `file too large for whisper (${input.size} > ${GROQ_MAX_BYTES} bytes)`,
+    }
+  }
+
+  const run = input.runLocal ?? defaultRunLocal
+
+  try {
+    const downloaded = await input.downloadFile(input.fileId)
+
+    if (downloaded.size !== undefined && downloaded.size > GROQ_MAX_BYTES) {
+      return {
+        status: 'skipped',
+        errorMessage: `file too large for whisper (${downloaded.size} > ${GROQ_MAX_BYTES} bytes)`,
+      }
+    }
+
+    const { code, stdout, stderr } = await run(command, [downloaded.path, config.voice.language])
+
+    if (code !== 0) {
+      return {
+        status: 'failed',
+        errorMessage: `local transcriber exited ${code}: ${stderr.trim().slice(0, 200)}`,
+      }
+    }
+
+    // Empty output means silent or unintelligible audio — same contract as
+    // the Groq path: status ok with an empty transcript, not a failure.
+    return { transcript: stdout.trim(), status: 'ok' }
+  } catch (err) {
+    return {
+      status: 'failed',
+      errorMessage: err instanceof Error ? err.message : String(err),
+    }
+  }
 }
 
 // Redact any occurrence of the API key from a string, even partial
@@ -245,19 +306,54 @@ function redactGroqKey(message: string, key: string): string {
   return message.replace(re, '[REDACTED]')
 }
 
+// Spawn the configured local transcriber. Kept out of maybeTranscribeVoice
+// so the dynamic import only happens on the local path — the Groq path and
+// every unit test stay free of a node:child_process dependency.
+async function defaultRunLocal(
+  command: string,
+  args: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const { execFile } = await import('node:child_process')
+  return await new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { timeout: LOCAL_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err && typeof (err as NodeJS.ErrnoException).code === 'string') {
+          // Spawn-level failure (ENOENT, EACCES) — no exit code to report.
+          reject(err)
+          return
+        }
+        const code = err ? ((err as { code?: number }).code ?? 1) : 0
+        resolve({ code, stdout: String(stdout), stderr: String(stderr) })
+      },
+    )
+  })
+}
+
+// A minute of speech transcribes in well under a minute on CPU; 10 minutes
+// is a generous ceiling that still stops a wedged process from pinning the
+// bridge forever.
+const LOCAL_TIMEOUT_MS = 10 * 60 * 1000
+
 export async function maybeTranscribeVoice(
   input: VoiceTranscriptionInput,
   config: AppConfig,
   env: { GROQ_API_KEY?: string },
 ): Promise<VoiceTranscriptionResult> {
-  const key = env.GROQ_API_KEY
-  if (!key) {
-    return { status: 'missing_key' }
-  }
-
   // Voice provider can be disabled in config.json (provider: 'none').
   if (config.voice.provider === 'none') {
     return { status: 'skipped', errorMessage: 'voice provider disabled in config' }
+  }
+
+  if (config.voice.provider === 'local') {
+    return await transcribeLocally(input, config)
+  }
+
+  const key = env.GROQ_API_KEY
+  if (!key) {
+    return { status: 'missing_key' }
   }
 
   // Size guard BEFORE download. `input.size` is the Telegram-reported

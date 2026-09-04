@@ -194,7 +194,19 @@ chats:
     system_reminder: "Это личный DM вождя."
     idle_ttl_ms: 1800000                      # 30 мин до выгрузки tmux-сессии (default)
     max_queue_depth: 1                        # сколько inbound сообщений можно поставить в очередь (default 1)
+  "-1004448021275":
+    mode: public
+    streaming: off
+    tmux_mirror: false
+    edit_message_progress: false
+    delivery: final_only
+    persona_file: chats/personas/group.md
+    handoff_file: core/hot/handoff.md
+    system_reminder: "Рабочая группа."
+    passive_log: true                         # писать ВСЕ сообщения чата в транскрипт (default: поле отсутствует = off)
 ```
+
+`passive_log: true` включает пассивный лог чата: КАЖДОЕ сообщение группы — включая те, что боту не адресованы и которые addressing-гейт молча роняет — дописывается строкой JSON в `{state_dir}/chats/<chat_id>/transcript/<YYYY-MM-DD>.jsonl` (день — UTC, по времени сообщения). Бот на такие сообщения по-прежнему НЕ отвечает и сессию под них не поднимает: лог — единственный побочный эффект. Поля строки: `ts`, `chat_id`, `user_id`, `username?`, `name?`, `message_id`, `kind`, `text`, `addressed`. Сбой записи логируется как `transcript.append_failed` и никогда не роняет обработку сообщения.
 
 Per-chat persona-файл резолвится относительно `multichat.workspace_dir`. Оверлей накладывает SessionStart-хук `chats/hooks/session-start.sh`: он читает `{workspace}/chats/{chat_id}/persona.md` внутри tmux-сессии и инжектит поверх единой Thrall identity через `additionalContext`. Никаких отдельных CLAUDE.md per chat не нужно.
 
