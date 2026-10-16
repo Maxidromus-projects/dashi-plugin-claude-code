@@ -112,6 +112,21 @@ export interface SendMessageOpts {
   // window. Consumed and STRIPPED by createReliableTelegramApi; never reaches
   // the wire.
   skipOutboundStamp?: boolean
+  // Task 201 item 3 (2026-10-16): opt IN to the durable outbound retry queue.
+  // Set ONLY by the reply tool's text chunks (owner-facing answers). When the
+  // send fails provably before Telegram accepted it (pre_send / 429), the
+  // reliable layer persists it to disk and resolves `{ queued: true }`
+  // instead of dead-lettering. Consumed and STRIPPED by
+  // createReliableTelegramApi; never reaches the wire.
+  durable?: boolean
+}
+
+// sendMessage result. `queued: true` (message_id 0) means the reliable layer
+// diverted the message to the durable outbound retry queue: NOT delivered yet,
+// will be delivered automatically — the caller must not resend it.
+export interface SendMessageResult {
+  message_id: number
+  queued?: boolean
 }
 
 export interface EditOpts {
@@ -167,7 +182,7 @@ export interface AnswerGuestQueryOpts {
 }
 
 export interface TelegramApi {
-  sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
+  sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<SendMessageResult>
   // Telegram Bot API 10.1 Rich Messages: ship RAW markdown that Telegram
   // renders server-side (tables/math/headings/task-lists/<details>/footnotes,
   // up to 32768 bytes). The result is either a message_id (sent) or
@@ -735,6 +750,14 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const replyToId = args.reply_to !== undefined ? Number(args.reply_to) : undefined
 
         const sentIds: number[] = []
+        // Task 201 item 3: parts diverted to the durable outbound retry queue
+        // (network down before Telegram accepted them). They deliver later on
+        // their own — counted separately so the tool result stays honest.
+        let queuedParts = 0
+        const track = (out: { message_id: number; queued?: boolean }): void => {
+          if (out.queued === true) queuedParts += 1
+          else sentIds.push(out.message_id)
+        }
 
         // ── M1 Rich Messages (Bot API 10.1) ─────────────────────────────
         // Attempt a single RAW-markdown rich send when ALL conditions hold.
@@ -797,12 +820,12 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           const rendered = markdownToTelegramHtml(args.text)
           const chunks = splitMessage(rendered)
           for (let i = 0; i < chunks.length; i++) {
-            const chunkOpts: SendMessageOpts = { parse_mode: 'HTML' }
+            const chunkOpts: SendMessageOpts = { parse_mode: 'HTML', durable: true }
             if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId
             const chunk = chunks[i] as string
             try {
               const out = await telegramApi.sendMessage(args.chat_id, chunk, chunkOpts)
-              sentIds.push(out.message_id)
+              track(out)
             } catch (err) {
               if (isTelegramHtmlParseError(err)) {
                 // Telegram rejected our HTML. Retry the SAME chunk as plain
@@ -812,10 +835,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
                   chunk_index: i,
                   error: err instanceof Error ? err.message : String(err),
                 })
-                const plainOpts: SendMessageOpts = {}
+                const plainOpts: SendMessageOpts = { durable: true }
                 if (i === 0 && replyToId !== undefined) plainOpts.reply_to_message_id = replyToId
                 const out = await telegramApi.sendMessage(args.chat_id, chunk, plainOpts)
-                sentIds.push(out.message_id)
+                track(out)
               } else {
                 throw err
               }
@@ -830,19 +853,25 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // (the tag-balance path is a no-op when no <pre>/<code> tags).
           const chunks = splitMessage(args.text)
           for (let i = 0; i < chunks.length; i++) {
-            const chunkOpts: SendMessageOpts = {}
+            const chunkOpts: SendMessageOpts = { durable: true }
             if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId
             if (args.format === 'markdownv2') chunkOpts.parse_mode = 'MarkdownV2'
             const chunk = chunks[i] as string
             const sent = await telegramApi.sendMessage(args.chat_id, chunk, chunkOpts)
-            sentIds.push(sent.message_id)
+            track(sent)
           }
         }
 
         // Attachments. We send the canonical (realpath-resolved) path so a
         // symlink or relative path inside the workspace becomes the absolute
         // file ultimately handed to grammY's InputFile.
-        for (const canonical of canonicalFiles) {
+        //
+        // Task 201 item 3: when any text part was queued the network is down
+        // — attachments are NOT queued (files can change or vanish), and
+        // sending them now would both fail and overtake the queued text. Skip
+        // them and say so in the result so the agent resends ONLY the files.
+        const skippedAttachments = queuedParts > 0 ? canonicalFiles.length : 0
+        for (const canonical of queuedParts > 0 ? [] : canonicalFiles) {
           const opts: SendDocumentOpts = {}
           if (args.reply_to !== undefined) opts.reply_to_message_id = Number(args.reply_to)
           const out = isPhotoExtension(canonical)
@@ -863,10 +892,20 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           })
         }
 
-        const result =
+        let result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        if (queuedParts > 0) {
+          const sentPart = sentIds.length > 0 ? `${result}; ` : ''
+          result =
+            `${sentPart}queued ${queuedParts} part(s) for delayed delivery: Telegram is unreachable ` +
+            `(network failure before the request was accepted). They will be delivered ` +
+            `automatically, in order, when the network is back (up to 24h, with a delay marker) — do NOT resend.`
+          if (skippedAttachments > 0) {
+            result += ` ${skippedAttachments} attachment(s) were NOT sent — resend only the files later.`
+          }
+        }
 
         // Observe-only TOV/format check (2026-07-09): compute cheap rule-code
         // metrics on the OUTGOING body and surface them back to the agent as a

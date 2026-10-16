@@ -412,3 +412,187 @@ describe('outbound recording rules', () => {
     expect(h.deadLetters).toEqual([])
   })
 })
+
+// ── Task 201 item 3 (2026-10-16): Bun transport codes + durable queue ──
+// Live probe (bun 1.3.14 + grammY 1.44): a refused connection AND a DNS
+// failure both surface as HttpError{ error: { code: 'ConnectionRefused' } };
+// a no-route (ENETUNREACH) surfaces as code 'FailedToOpenSocket'. Neither
+// matched the Node-style code list, so the wrapper's message text
+// ("Network request for 'sendMessage' failed!") hit the generic «network»
+// match → ambiguous → dead-lettered with NO retry (the 2026-09-06 records).
+function bunWrapped(code: string, message: string): Error {
+  const inner = new Error(message) as Error & { code: string }
+  inner.code = code
+  const e = new Error("Network request for 'sendMessage' failed!") as Error & {
+    name: string
+    error: Error
+  }
+  e.name = 'HttpError'
+  e.error = inner
+  return e
+}
+
+describe('classifySendError — Bun / connect-phase transport codes', () => {
+  test('Bun ConnectionRefused (refused port AND DNS failure) → pre_send', () => {
+    expect(
+      classifySendError(
+        bunWrapped('ConnectionRefused', 'Unable to connect. Is the computer able to access the url?'),
+        CAP,
+      ).kind,
+    ).toBe('pre_send')
+  })
+  test('Bun FailedToOpenSocket (no route to network) → pre_send', () => {
+    expect(
+      classifySendError(bunWrapped('FailedToOpenSocket', 'Was there a typo in the url or port?'), CAP)
+        .kind,
+    ).toBe('pre_send')
+  })
+  test('Node connect-phase unreachable codes → pre_send', () => {
+    for (const c of ['ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL']) {
+      expect(classifySendError(httpWrapped(sysError(c)), CAP).kind).toBe('pre_send')
+    }
+  })
+  test('grammY request timeout / Bun mid-connection closes stay ambiguous', () => {
+    expect(
+      classifySendError(
+        httpWrapped(new Error("Request to 'sendMessage' timed out after 3 seconds")),
+        CAP,
+      ).kind,
+    ).toBe('ambiguous')
+    expect(classifySendError(bunWrapped('ConnectionClosed', 'closed'), CAP).kind).toBe('ambiguous')
+    expect(classifySendError(bunWrapped('ConnectionResetByPeer', 'reset'), CAP).kind).toBe(
+      'ambiguous',
+    )
+    expect(classifySendError(bunWrapped('ConnectionTimedOut', 'timed out'), CAP).kind).toBe(
+      'ambiguous',
+    )
+  })
+})
+
+interface QueueCall {
+  chatId: string
+  text: string
+  opts: SendMessageOpts
+  errorClass?: string | undefined
+  retryAfterMs?: number | undefined
+}
+function stubQueue(pending: Set<string> = new Set()): {
+  calls: QueueCall[]
+  queue: NonNullable<ReliableOptions['retryQueue']>
+} {
+  const calls: QueueCall[] = []
+  return {
+    calls,
+    queue: {
+      hasPending: (chatId: string) => pending.has(chatId),
+      enqueue: (e) => {
+        calls.push(e)
+        pending.add(e.chatId)
+      },
+    },
+  }
+}
+
+describe('durable sends → outbound retry queue', () => {
+  test('pre_send exhaustion on a durable send → queued, NOT dead-lettered, not stamped', async () => {
+    const refused = (): Error => bunWrapped('ConnectionRefused', 'Unable to connect.')
+    const stub = makeStub({ sendMessage: refused })
+    const q = stubQueue()
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    const res = await api.sendMessage('100', 'hello', { parse_mode: 'HTML', durable: true })
+    expect(res).toEqual({ message_id: 0, queued: true })
+    expect(stub.sendMessageCalls).toBe(3) // in-line retries still happen first
+    expect(h.deadLetters).toEqual([])
+    expect(h.outbound).toEqual([])
+    expect(q.calls.length).toBe(1)
+    expect(q.calls[0]!.chatId).toBe('100')
+    expect(q.calls[0]!.text).toBe('hello')
+    expect(q.calls[0]!.opts.parse_mode).toBe('HTML')
+    expect('durable' in (stub.lastSendOpts ?? {})).toBe(false) // flag stripped downstream
+  })
+
+  test('escaped 429 on a durable send → queued with the real retry_after', async () => {
+    const stub = makeStub({ sendMessage: () => grammyError(429, 'Too Many Requests', 300) })
+    const q = stubQueue()
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    const res = await api.sendMessage('100', 'hi', { durable: true })
+    expect(res.queued).toBe(true)
+    expect(stub.sendMessageCalls).toBe(1)
+    expect(q.calls[0]!.errorClass).toBe('rate_limited')
+    expect(q.calls[0]!.retryAfterMs).toBe(300_000)
+    expect(h.deadLetters).toEqual([])
+  })
+
+  test('ambiguous on a durable send keeps the old policy: dead-letter + throw (no dup risk)', async () => {
+    const stub = makeStub({ sendMessage: () => grammyError(502, 'Bad Gateway') })
+    const q = stubQueue()
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(api.sendMessage('100', 'hi', { durable: true })).rejects.toThrow('Bad Gateway')
+    expect(q.calls).toEqual([])
+    expect(h.deadLetters.length).toBe(1)
+  })
+
+  test('chat already has queued messages → new durable send queues behind them (order)', async () => {
+    const stub = makeStub({ sendMessage: () => ({ message_id: 5 }) })
+    const q = stubQueue(new Set(['100']))
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    const res = await api.sendMessage('100', 'later', { durable: true })
+    expect(res.queued).toBe(true)
+    expect(stub.sendMessageCalls).toBe(0)
+    expect(q.calls[0]!.text).toBe('later')
+  })
+
+  test('non-durable sends are untouched: pre_send exhaustion still dead-letters', async () => {
+    const stub = makeStub({ sendMessage: () => sysError('ECONNREFUSED') })
+    const q = stubQueue()
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(api.sendMessage('100', 'hud', { skipOutboundStamp: true })).rejects.toThrow()
+    expect(q.calls).toEqual([])
+    expect(h.deadLetters.length).toBe(1)
+  })
+
+  test('durable send with an inline keyboard is never queued (stale buttons)', async () => {
+    const stub = makeStub({ sendMessage: () => sysError('ECONNREFUSED') })
+    const q = stubQueue()
+    const h = harness({ retryQueue: q.queue })
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(
+      api.sendMessage('100', 'pick', {
+        durable: true,
+        reply_markup: { inline_keyboard: [[{ text: 'a', callback_data: 'a' }]] },
+      }),
+    ).rejects.toThrow()
+    expect(q.calls).toEqual([])
+  })
+
+  test('no queue wired → durable flag is inert (old behaviour)', async () => {
+    const stub = makeStub({ sendMessage: () => sysError('ECONNREFUSED') })
+    const h = harness()
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(api.sendMessage('100', 'x', { durable: true })).rejects.toThrow()
+    expect(h.deadLetters.length).toBe(1)
+  })
+})
+
+describe('sendRichMessage transport failures', () => {
+  test('pre_send → transparent { fallback: true } (provably undelivered, HTML path takes over)', async () => {
+    const stub = makeStub({
+      sendRichMessage: () => bunWrapped('ConnectionRefused', 'Unable to connect.'),
+    })
+    const h = harness()
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    expect(await api.sendRichMessage('100', 'md', {})).toEqual({ fallback: true })
+    expect(h.outbound).toEqual([])
+  })
+  test('ambiguous still throws (the rich send may have landed)', async () => {
+    const stub = makeStub({ sendRichMessage: () => grammyError(502, 'Bad Gateway') })
+    const h = harness()
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(api.sendRichMessage('100', 'md', {})).rejects.toThrow('Bad Gateway')
+  })
+})

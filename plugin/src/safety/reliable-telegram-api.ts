@@ -27,6 +27,15 @@
 // (re-editing to the same content is harmless; Telegram's «message is not
 // modified» response is normalized to success).
 //
+// DURABLE QUEUE (task 201 item 3, 2026-10-16): a sendMessage marked
+// `durable: true` (reply-tool text chunks) that gives up on a PROVABLY
+// undelivered failure — pre_send after the in-line retries, or an escaped 429
+// — is diverted to the on-disk outbound retry queue (outbound-retry-queue.ts)
+// instead of dead-letter, and resolves `{ message_id: 0, queued: true }`. Once
+// a chat has queued messages, later durable sends to it queue behind them
+// (per-chat order). Ambiguous failures are never queued. A rich send that
+// fails pre_send falls back transparently to the HTML path.
+//
 // 429 (rate_limited) is NEVER retried here (fix-loop-1 #2): the INNER
 // rate-limited layer already owns 429s (3 attempts, retry_after ≤60s each) —
 // by the time one escapes to this layer ~3 minutes of backoff are already
@@ -70,6 +79,7 @@ import type {
   EditOpts,
   SendDocumentOpts,
   SendMessageOpts,
+  SendMessageResult,
   SendRichMessageOpts,
   SendRichMessageResult,
   TelegramApi,
@@ -85,8 +95,10 @@ export type SendErrorClass =
   | { kind: 'ambiguous' }
   | { kind: 'rate_limited'; retryAfterMs: number }
 
-/** The transient classes a dead-letter record can carry. */
-export type OutboundErrorClass = 'pre_send' | 'ambiguous' | 'rate_limited'
+/** The classes a dead-letter record can carry. `permanent` and `expired` are
+ *  written only by the durable outbound retry queue (a replayed message that
+ *  Telegram rejected outright, or one older than the queue's max age). */
+export type OutboundErrorClass = 'pre_send' | 'ambiguous' | 'rate_limited' | 'permanent' | 'expired'
 
 // Pull an HTTP-ish status code from the many shapes an error can take (grammY
 // GrammyError.error_code, a fetch Response-ish .status/.statusCode).
@@ -145,11 +157,26 @@ function extractMessage(err: unknown): string {
 }
 
 // Connection provably never established → the request never left us.
+// Task 201 item 3 (2026-10-16): Bun's fetch does NOT use Node errno names.
+// Live probe (bun 1.3.14 + grammY 1.44): refused port AND DNS failure →
+// HttpError{ error: { code: 'ConnectionRefused' } }; no route (ENETUNREACH)
+// → code 'FailedToOpenSocket'. Before this list knew them, those fell through
+// to the generic «network» message match → ambiguous → dead-lettered with no
+// retry (owner replies silently lost during outages). The Node unreachable
+// family (ENETUNREACH & co.) fails connect() before a SYN leaves the host.
+// Codes are compared upper-cased (extractSyscallCodes).
 const PRE_SEND_CODES: ReadonlySet<string> = new Set([
   'ECONNREFUSED',
   'ENOTFOUND',
   'EAI_AGAIN',
   'UND_ERR_CONNECT_TIMEOUT',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'EHOSTDOWN',
+  'EADDRNOTAVAIL',
+  'CONNECTIONREFUSED', // Bun
+  'FAILEDTOOPENSOCKET', // Bun
 ])
 // Connection existed (or state unknown) when it died → Telegram may have
 // already processed the request.
@@ -158,6 +185,11 @@ const AMBIGUOUS_CODES: ReadonlySet<string> = new Set([
   'ETIMEDOUT',
   'EPIPE',
   'UND_ERR_SOCKET',
+  // Bun names for a connection that existed when it died. ConnectionTimedOut
+  // is kept here too: Bun does not say which phase timed out.
+  'CONNECTIONCLOSED',
+  'CONNECTIONRESETBYPEER',
+  'CONNECTIONTIMEDOUT',
 ])
 
 /**
@@ -194,7 +226,11 @@ export function classifySendError(err: unknown, retryAfterCapMs: number): SendEr
     msg.includes('econnrefused') ||
     msg.includes('enotfound') ||
     msg.includes('eai_again') ||
-    msg.includes('getaddrinfo')
+    msg.includes('getaddrinfo') ||
+    msg.includes('enetunreach') ||
+    msg.includes('ehostunreach') ||
+    msg.includes('network is unreachable') ||
+    msg.includes('no route to host')
   ) {
     return { kind: 'pre_send' }
   }
@@ -244,9 +280,11 @@ export interface OutboundDeadLetter {
   attempts: number
   error: string
   error_class: OutboundErrorClass
+  /** Durable queue only: how long the message waited before giving up. */
+  queue_age_ms?: number
 }
 
-function payloadHash(body: string): { sha: string; bytes: number } {
+export function payloadHash(body: string): { sha: string; bytes: number } {
   const bytes = Buffer.byteLength(body, 'utf8')
   const sha = createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16)
   return { sha, bytes }
@@ -271,7 +309,32 @@ export interface ReliableOptions {
   deadLetter?: (record: OutboundDeadLetter) => void
   /** Stamp the outbound-activity clock on a successful NEW-message send. */
   recordOutbound?: (chatId: string, atMs: number) => void
+  /**
+   * Durable outbound retry queue (task 201 item 3). When wired, a sendMessage
+   * carrying `durable: true` (the reply tool's text chunks) whose failure is
+   * PROVABLY pre-acceptance — pre_send after the in-line retries, or an
+   * escaped 429 — is persisted here instead of dead-lettered, and the call
+   * resolves `{ message_id: 0, queued: true }`. Ambiguous failures are never
+   * queued (duplicate risk). Server wires createOutboundRetryQueue().
+   */
+  retryQueue?: OutboundRetryQueueSink
 }
+
+/** The slice of the durable queue this layer needs (keeps the import type-only). */
+export interface OutboundRetryQueueSink {
+  hasPending(chatId: string): boolean
+  enqueue(entry: {
+    chatId: string
+    text: string
+    opts: SendMessageOpts
+    errorClass?: 'pre_send' | 'rate_limited'
+    retryAfterMs?: number | undefined
+  }): unknown
+}
+
+/** 429 retry_after clamp used when diverting to the durable queue — the queue
+ *  waits out the REAL value (it does not block anyone), bounded at 1h. */
+const QUEUE_RETRY_AFTER_CAP_MS = 3_600_000
 
 const DEFAULT_BACKOFFS_MS = [1000, 5000]
 const DEFAULT_RETRY_AFTER_CAP_MS = 30_000
@@ -347,6 +410,10 @@ export function createReliableTelegramApi(
     idempotent: boolean,
     op: () => Promise<T>,
     describe: () => { method: string; chatId: string; body: string },
+    // Durable diversion: called for a provably-undelivered give-up (pre_send
+    // exhausted, or escaped 429). A non-undefined return replaces the
+    // dead-letter + rethrow. Never consulted for ambiguous/permanent.
+    divert?: (err: unknown, cls: SendErrorClass) => T | undefined,
   ): Promise<T> {
     let attempt = 0
     for (;;) {
@@ -363,6 +430,10 @@ export function createReliableTelegramApi(
         const retryable =
           cls.kind === 'pre_send' || (idempotent && cls.kind === 'ambiguous')
         if (!retryable || attempt > maxRetries) {
+          if (divert !== undefined && (cls.kind === 'pre_send' || cls.kind === 'rate_limited')) {
+            const diverted = divert(err, cls)
+            if (diverted !== undefined) return diverted
+          }
           writeDeadLetterRecord(describe(), attempt, err, cls.kind)
           throw err
         }
@@ -381,15 +452,60 @@ export function createReliableTelegramApi(
   }
 
   return {
-    async sendMessage(chatId, text, sendOpts: SendMessageOpts): Promise<{ message_id: number }> {
-      // Strip the wrapper-only flag so it never travels downstream (the safe
+    async sendMessage(chatId, text, sendOpts: SendMessageOpts): Promise<SendMessageResult> {
+      // Strip the wrapper-only flags so they never travel downstream (the safe
       // wrapper spreads opts; grammY must never see a foreign field).
-      const { skipOutboundStamp, ...rest } = sendOpts
-      const res = await withRetry(
+      const { skipOutboundStamp, durable, ...rest } = sendOpts
+      const queue = opts.retryQueue
+      // Inline keyboards are never queued: buttons delivered hours late would
+      // act on a stale question.
+      const queueable = durable === true && queue !== undefined && rest.reply_markup === undefined
+      const enqueue = (
+        errorClass: 'pre_send' | 'rate_limited',
+        retryAfterMs?: number,
+      ): SendMessageResult | undefined => {
+        if (!queueable) return undefined
+        try {
+          queue.enqueue({ chatId, text, opts: rest, errorClass, retryAfterMs })
+        } catch (qErr) {
+          // A failed persist must fall back to the honest dead-letter path.
+          log.warn('outbound retry queue enqueue failed — falling back to dead-letter', {
+            chat_id: chatId,
+            error: qErr instanceof Error ? qErr.message : String(qErr),
+          })
+          return undefined
+        }
+        log.warn('outbound send queued for durable retry', {
+          method: 'sendMessage',
+          chat_id: chatId,
+          error_class: errorClass,
+        })
+        return { message_id: 0, queued: true }
+      }
+      // Per-chat ORDER: once a chat has queued messages, every later durable
+      // send to it goes behind them, even if the network is back right now.
+      if (queueable && queue.hasPending(chatId)) {
+        const queued = enqueue('pre_send')
+        if (queued !== undefined) return queued
+      }
+      const res = await withRetry<SendMessageResult>(
         false,
         () => raw.sendMessage(chatId, text, rest),
         () => ({ method: 'sendMessage', chatId, body: text }),
+        queueable
+          ? (err, cls): SendMessageResult | undefined =>
+              cls.kind === 'rate_limited'
+                ? enqueue(
+                    'rate_limited',
+                    (() => {
+                      const c = classifySendError(err, QUEUE_RETRY_AFTER_CAP_MS)
+                      return c.kind === 'rate_limited' ? c.retryAfterMs : undefined
+                    })(),
+                  )
+                : enqueue('pre_send')
+          : undefined,
       )
+      if (res.queued === true) return res
       if (skipOutboundStamp !== true) stampOutbound(chatId)
       return res
     },
@@ -405,7 +521,24 @@ export function createReliableTelegramApi(
       // the rate-limiter's queue. We only stamp the outbound clock on a REAL
       // send (message_id) — a transparent { fallback: true } means the HTML
       // path (sendMessage) ships and stamps.
-      const res = await raw.sendRichMessage(chatId, rawMarkdown, richOpts)
+      //
+      // Task 201 item 3: a PRE_SEND transport failure (connection provably
+      // never established) means Telegram never saw the rich send, so the
+      // transparent fallback is safe — the reply tool's HTML path then ships
+      // the body, with in-line retries and the durable queue behind it.
+      // Ambiguous failures still throw (the rich send may have landed).
+      let res: SendRichMessageResult
+      try {
+        res = await raw.sendRichMessage(chatId, rawMarkdown, richOpts)
+      } catch (err) {
+        if (classifySendError(err, retryAfterCapMs).kind === 'pre_send') {
+          log.warn('rich send transport failure before connect — falling back to HTML path', {
+            chat_id: chatId,
+          })
+          return { fallback: true }
+        }
+        throw err
+      }
       if ('message_id' in res) stampOutbound(chatId)
       return res
     },

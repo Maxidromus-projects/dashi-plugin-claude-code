@@ -466,6 +466,13 @@ Outbound traffic goes through a token-bucket limiter (`src/safety/rate-limited-t
 
 Separately, the poller on the **inbound** path honors `retry_after` on `getUpdates` (section 8).
 
+### Outbound reliability: durable retry queue
+
+Every send passes through `reliable-telegram-api.ts`, which sorts a failure into one of two cases:
+
+- **The request provably never reached Telegram** (`pre_send`: connection refused, DNS failure, no route; Bun reports these as `ConnectionRefused` / `FailedToOpenSocket`), or Telegram refused it with a 429. Sending it again cannot create a duplicate. The send is retried in-line (1 s, 5 s). If that fails too, a **reply-tool text chunk** is written to a durable queue `{state_dir}/outbound-retry/` (one JSON file per message, atomic write, 0600, text redacted). It is then replayed in the background in per-chat order with backoff (5 s → 5 min) and honors `retry_after`. The queue is reloaded on startup. A message delivered more than 2 min late gets the prefix `(отправлено с задержкой, исходно HH:MM UTC)`. After 24 h it goes to `dead-letter/outbound/` with an error log. The tool result says `queued … do NOT resend`. Attachments are not queued.
+- **The request may have reached Telegram** (`ambiguous`: 5xx, connection reset, request timeout). Sending it again could deliver it twice, so it goes to dead-letter at once with an honest tool error, as before. HUD, heartbeat and status sends are never queued.
+
 > The practical meaning of the limits: three replies in a row into one chat may hit the per-chat 429 with a large `retry_after`. For multi-part reports — either pace them out or merge into a single message.
 
 ---

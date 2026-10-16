@@ -46,7 +46,8 @@ import {
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
-import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
+import { createOutboundRetryQueue } from './safety/outbound-retry-queue.js'
+import { createReliableTelegramApi, type OutboundDeadLetter } from './safety/reliable-telegram-api.js'
 import { OutboundActivityTracker } from './status/outbound-activity.js'
 import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
 import { createRichLatch } from './safety/rich-latch.js'
@@ -468,13 +469,41 @@ const safeTelegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSe
 // can embed the api.telegram.org/bot<token>/ URL, and the quarantine files,
 // while 0600, must never store the token.
 const outboundTracker = new OutboundActivityTracker()
+const writeOutboundDeadLetter = (record: OutboundDeadLetter): void => {
+  writeDeadLetter(statePaths, 'outbound', {
+    ...record,
+    error: redactSecrets(record.error, apiSecrets),
+  })
+}
+// Task 201 item 3 (2026-10-16): durable outbound retry queue. Reply-tool text
+// chunks that fail PROVABLY before Telegram accepted them (pre_send transport
+// failure after the in-line retries, or an escaped 429) are persisted under
+// `<state>/outbound-retry/` and replayed in per-chat order with backoff, up
+// to 24h (then dead-letter). Replays go through the SAFE layer (redact +
+// HTML validate → rate-limit → grammY) — never back through the reliable
+// layer, so a replay can never re-enqueue itself. Loaded from disk on start,
+// so a restart does not lose queued replies.
+const outboundRetryQueue = createOutboundRetryQueue({
+  dir: join(statePaths.root, 'outbound-retry'),
+  log,
+  send: (chatId, text, opts) => safeTelegramApi.sendMessage(chatId, text, opts),
+  deadLetter: writeOutboundDeadLetter,
+  onDelivered: (chatId, atMs) => outboundTracker.record(chatId, atMs),
+  redact: (text) => redactSecrets(text, apiSecrets),
+})
+try {
+  outboundRetryQueue.start()
+} catch (err) {
+  // A broken queue dir must not stop the channel: sends then fall back to the
+  // pre-queue behaviour (dead-letter) via the enqueue try/catch.
+  log.error('outbound retry queue failed to start', {
+    error: redactSecrets(err instanceof Error ? err.message : String(err), apiSecrets),
+  })
+}
 const telegramApi = createReliableTelegramApi(safeTelegramApi, log, {
-  deadLetter: (record) =>
-    writeDeadLetter(statePaths, 'outbound', {
-      ...record,
-      error: redactSecrets(record.error, apiSecrets),
-    }),
+  deadLetter: writeOutboundDeadLetter,
   recordOutbound: (chatId, atMs) => outboundTracker.record(chatId, atMs),
+  retryQueue: outboundRetryQueue,
 })
 
 const mcp = new Server(
@@ -1375,6 +1404,8 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   log.info('shutting down')
+  // Pending queue entries stay on disk and are replayed by the next start.
+  outboundRetryQueue.stop()
 
   // Best-effort: clean up any pulsing status messages so the chat doesn't
   // show a stale "Печатает..." after the bot dies. Errors are swallowed
