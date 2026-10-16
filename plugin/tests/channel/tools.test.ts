@@ -855,3 +855,49 @@ describe('autonomy tool — fix-loop-2', () => {
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 })
+
+// Task 201 item 3 (2026-10-16): durable outbound queue integration.
+describe('reply → durable outbound queue', () => {
+  test('text chunks are sent with durable: true', async () => {
+    const seen: SendMessageOpts[] = []
+    const api = makeStubApi({
+      sendMessage: async (_c, _t, opts) => {
+        seen.push(opts)
+        return { message_id: 7 }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    await callTool(callReq('reply', { chat_id: '164795011', text: 'hi', format: 'text' }), deps)
+    await callTool(callReq('reply', { chat_id: '164795011', text: 'hi **b**' }), deps)
+    expect(seen.length).toBe(2)
+    expect(seen.every((o) => o.durable === true)).toBe(true)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('queued send → honest «queued, do NOT resend» result, attachments not attempted', async () => {
+    const ws = mkdtempSync(join(tmpdir(), 'agent47-ws-'))
+    const file = join(ws, 'a.txt')
+    await Bun.write(file, 'x')
+    let docCalls = 0
+    const api = makeStubApi({
+      sendMessage: async () => ({ message_id: 0, queued: true }),
+      sendDocument: async () => {
+        docCalls++
+        return { message_id: 2 }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api, config: makeConfig({ workspace_root: ws }) })
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'report', files: [file] }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    const text = result.content[0]?.text ?? ''
+    expect(text).toContain('queued')
+    expect(text).toContain('do NOT resend')
+    expect(text).toContain('attachment')
+    expect(docCalls).toBe(0)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    rmSync(ws, { recursive: true, force: true })
+  })
+})
