@@ -164,6 +164,23 @@ describe('TelegramPoller.pollOnce', () => {
     expect(result.offsetAfter).toBe(42)
   })
 
+  test('requests widget_query updates (Bot API 10.4 supplements widget)', async () => {
+    const { bot } = makeBotStub()
+    let allowed: ReadonlyArray<string> | undefined
+    const poller = new TelegramPoller(
+      { bot, config, statePaths: paths, log: createLogger('test'), onUpdate: async () => undefined },
+      {
+        getUpdates: async (params) => {
+          allowed = params.allowed_updates
+          return []
+        },
+      },
+    )
+    await poller.pollOnce()
+    expect(allowed).toContain('widget_query')
+    expect(allowed).toContain('message')
+  })
+
   test('advances offset after successful handle', async () => {
     const { bot, calls } = makeBotStub()
     const poller = new TelegramPoller(
