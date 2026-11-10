@@ -113,6 +113,20 @@ bash plugin/scripts/install-hooks.sh \
 
 Если роут недоступен (или `sendMessage` не вписан в деплой — отвечает 503) — хук тихо ничего не делает.
 
+## Supplements widget (Bot API 10.4, opt-in, default OFF)
+
+The evening supplements check-in can be sent as an HTML widget with a tick-box per unmarked supplement and «Принял всё»: `maxos-supplements.py widget` sends it (exit 3 = not delivered, send the plain list instead) and writes the item list to `<state_dir>/<chat>-<message>.json`. Taps arrive as `widget_query` updates (requested in `allowed_updates`); `src/telegram/supplements-widget.ts` maps them to `maxos-supplements.py log <intake> --date … [--except …] [--also …]`, answers the query and redraws the widget via `editMessageWidgetData`. Only `allowed_user_ids` can record. Enable in `config.json`:
+
+```json
+"supplements_widget": {
+  "enabled": true,
+  "script": "/abs/path/maxos-supplements.py",
+  "python": "/usr/bin/python3",
+  "state_dir": "/abs/path/state/supplements-widget",
+  "allowed_user_ids": [150304683]
+}
+```
+
 ## Environment variables
 
 Полный список — `plugin/src/config.ts` (`RuntimeEnvSchema`). Минимум:
