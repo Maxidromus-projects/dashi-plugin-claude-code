@@ -336,6 +336,20 @@ export const AppConfigSchema = z.object({
     enabled: z.boolean().default(false),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).optional(),
+  // Supplements check-in widget (Bot API 10.4, 2026-11-10) — handles
+  // `widget_query` taps from the widget sent by `maxos-supplements.py widget`
+  // and records them via `<python> <script> log …` (see
+  // telegram/supplements-widget.ts). Optional and OFF by default: other
+  // deployments of this fork never run the script.
+  //
+  // `allowed_user_ids` omitted → inherit the top-level `allowed_user_ids`.
+  supplements_widget: z.object({
+    enabled: z.boolean().default(false),
+    script: z.string().min(1),
+    python: z.string().min(1).default('python3'),
+    state_dir: z.string().min(1),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+  }).optional(),
   // Ask-guard (autonomy M3, 2026-07-10) — the ENFORCEMENT of owner-granted
   // autonomy mandates on the owner-egress reply path. When the agent holds an
   // ACTIVE lease for a chat and still writes a «жду го / дай добро»-style
@@ -833,6 +847,25 @@ export function resolveGuestModeAllowedUserIds(
   const inherited = config.allowed_user_ids
   if (log) log.info('guest_mode: allowed_user_ids unset, inheriting from allowed_user_ids', { count: inherited.length, fallback: true })
   return inherited
+}
+
+// resolveSupplementsWidget — the supplements widget block when enabled,
+// with allowed_user_ids resolved (explicit wins, else top-level
+// allowed_user_ids). Missing or disabled block → undefined (handler off).
+export function resolveSupplementsWidget(config: AppConfig): {
+  script: string
+  python: string
+  stateDir: string
+  allowedUserIds: readonly number[]
+} | undefined {
+  const block = config.supplements_widget
+  if (block === undefined || !block.enabled) return undefined
+  return {
+    script: block.script,
+    python: block.python,
+    stateDir: block.state_dir,
+    allowedUserIds: block.allowed_user_ids ?? config.allowed_user_ids,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────

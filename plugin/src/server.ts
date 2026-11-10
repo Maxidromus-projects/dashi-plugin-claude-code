@@ -33,6 +33,7 @@ import {
   resolveGuestModeEnabled,
   resolveHudEnabled,
   resolveOwnerChatIds,
+  resolveSupplementsWidget,
   type AppConfig,
   type StatePaths,
 } from './config.js'
@@ -109,6 +110,11 @@ import {
   type HandlerDeps,
 } from './telegram/handlers.js'
 import { GuestQueryRegistry } from './telegram/guest-queries.js'
+import {
+  createScriptRunner,
+  createSupplementsWidgetHandler,
+  type WidgetQueryLike,
+} from './telegram/supplements-widget.js'
 import { AlbumBuffer } from './telegram/album-buffer.js'
 import {
   ensureAlbumsDir,
@@ -1373,6 +1379,35 @@ bot.on('message:pinned_message', ctx => {
     })
   })
 })
+// Supplements widget (Bot API 10.4): taps from the owner's supplements
+// check-in widget arrive as `widget_query` updates, which grammY 1.44 does
+// not know — read the raw update and call the new methods through the raw
+// proxy. Registered only when config.supplements_widget.enabled. The handler
+// is NOT awaited: it runs a local script (up to ~11 s) and must not stall
+// the poller loop; it answers the query itself and never throws.
+const supplementsWidget = resolveSupplementsWidget(config)
+if (supplementsWidget !== undefined) {
+  const rawApi = bot.api.raw as unknown as Record<string, (p: Record<string, unknown>) => Promise<unknown>>
+  const onWidgetQuery = createSupplementsWidgetHandler({
+    allowedUserIds: supplementsWidget.allowedUserIds,
+    stateDir: supplementsWidget.stateDir,
+    runScript: createScriptRunner(supplementsWidget.python, supplementsWidget.script),
+    callApi: (method, payload) => {
+      const fn = rawApi[method]
+      if (fn === undefined) return Promise.reject(new Error(`no raw method ${method}`))
+      return fn(payload)
+    },
+    log,
+  })
+  bot.use(async (ctx, next) => {
+    const query = (ctx.update as { widget_query?: WidgetQueryLike }).widget_query
+    if (query === undefined) return next()
+    void onWidgetQuery(query)
+  })
+  log.info('supplements widget handler enabled', {
+    allowed_users: supplementsWidget.allowedUserIds.length,
+  })
+}
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
 bot.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
 bot.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))

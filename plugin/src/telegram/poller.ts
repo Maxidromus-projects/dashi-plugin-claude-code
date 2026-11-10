@@ -112,6 +112,10 @@ const ALLOWED_UPDATES: ReadonlyArray<Exclude<keyof Update, 'update_id'>> = [
   // the BotFather toggle is off — Telegram simply never emits it. The
   // handler itself is only registered when config.guest_mode.enabled.
   'guest_message',
+  // Bot API 10.4 widgets: taps from the supplements check-in widget. Not in
+  // grammY 1.44's Update type yet, hence the cast. Telegram only emits it
+  // for widgets this bot sent with allow_queries, so it is inert elsewhere.
+  'widget_query' as Exclude<keyof Update, 'update_id'>,
 ]
 
 // ─────────────────────────────────────────────────────────────────────
