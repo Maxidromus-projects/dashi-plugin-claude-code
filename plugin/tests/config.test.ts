@@ -8,6 +8,7 @@ import {
   redactToken,
   resolveAskGuardMode,
   resolveAskUserQuestionAllowedUserIds,
+  resolveSupplementsWidget,
   RuntimeEnvSchema,
 } from '../src/config.js'
 
@@ -651,5 +652,37 @@ describe('resolveAskGuardMode', () => {
     const cfg = loadConfig(env())
     process.env.ASK_GUARD_ENABLED = '1'
     expect(resolveAskGuardMode(cfg)).toBe('advisory')
+  })
+})
+
+describe('supplements_widget config', () => {
+  test('missing block → handler off', () => {
+    expect(resolveSupplementsWidget(loadConfig(env()))).toBeUndefined()
+  })
+
+  test('disabled block → handler off', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      supplements_widget: { enabled: false, script: '/x.py', state_dir: '/s' },
+    }))
+    expect(resolveSupplementsWidget(loadConfig(env()))).toBeUndefined()
+  })
+
+  test('enabled block resolves; allowed_user_ids inherits the top-level list when unset', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      supplements_widget: { enabled: true, script: '/x.py', state_dir: '/s' },
+    }))
+    expect(resolveSupplementsWidget(loadConfig(env({ TELEGRAM_ALLOWED_USER_IDS: '150304683' })))).toEqual({
+      script: '/x.py',
+      python: 'python3',
+      stateDir: '/s',
+      allowedUserIds: [150304683],
+    })
+  })
+
+  test('explicit allowed_user_ids wins', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      supplements_widget: { enabled: true, script: '/x.py', state_dir: '/s', allowed_user_ids: [7] },
+    }))
+    expect(resolveSupplementsWidget(loadConfig(env()))?.allowedUserIds).toEqual([7])
   })
 })
